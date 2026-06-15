@@ -1,0 +1,30 @@
+{
+  "name": "redu-chan",
+  "version": "1.0.0",
+  "description": "A Discord bot that polls GitHub repositories and logs new commits to designated channels.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LightNabz/redu-chan.git"
+  },
+  "keywords": [
+    "discord",
+    "bot"
+  ],
+  "author": "dasnabz",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/LightNabz/redu-chan/issues"
+  },
+  "homepage": "https://github.com/LightNabz/redu-chan#readme",
+  "dependencies": {
+    "commit": "^0.0.4",
+    "discord.js": "^14.26.4",
+    "dotenv": "^17.4.2",
+    "fs": "^0.0.1-security",
+    "node-cron": "^4.2.1"
+  }
+}

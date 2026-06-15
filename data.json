@@ -1,0 +1,22 @@
+{
+  "nextId": 2,
+  "repos": [
+    {
+      "id": 1,
+      "owner": "LightNabz",
+      "repo": "fin",
+      "url": "https://github.com/LightNabz/fin",
+      "lastSHA": null
+    },
+    {
+      "id": 2,
+      "owner": "LightNabz",
+      "repo": "LightNabz.github.io",
+      "url": "https://github.com/LightNabz/LightNabz.github.io",
+      "lastSHA": null
+    }
+  ],
+  "channels": {
+    "global": "1515704229866504312"
+  }
+}
