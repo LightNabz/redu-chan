@@ -2,7 +2,12 @@ const https = require('https');
 
 /**
  * Fetch commits from GitHub API since the last seen SHA.
- * Returns an array of commit objects (newest first), excluding lastSHA itself.
+ * Returns { newCommits, latestSHA }
+ *   - newCommits: array of commit objects newer than lastSHA (newest first)
+ *   - latestSHA:  the SHA of the most recent commit (should always be saved)
+ *
+ * On first call (lastSHA = null), newCommits is [] so we don't flood the
+ * channel with history, but latestSHA is still returned so future polls work.
  */
 async function fetchCommits(owner, repo, lastSHA = null) {
   const token = process.env.GITHUB_TOKEN;
@@ -20,19 +25,30 @@ async function fetchCommits(owner, repo, lastSHA = null) {
     throw new Error(`GitHub API: ${msg}`);
   }
 
-  if (!lastSHA) {
-    // First poll — just record the latest SHA, don't post anything
-    return [];
+  if (!commits.length) {
+    return { newCommits: [], latestSHA: lastSHA };
   }
 
-  // Return only commits newer than lastSHA
+  const latestSHA = commits[0].sha;
+
+  if (!lastSHA) {
+    // First poll — record latest SHA but don't post historical commits
+    return { newCommits: [], latestSHA };
+  }
+
+  if (lastSHA === latestSHA) {
+    // Nothing new since last poll
+    return { newCommits: [], latestSHA };
+  }
+
+  // Collect only commits newer than lastSHA
   const newCommits = [];
   for (const c of commits) {
     if (c.sha === lastSHA) break;
     newCommits.push(c);
   }
 
-  return newCommits;
+  return { newCommits, latestSHA };
 }
 
 function get(url, headers) {
@@ -52,4 +68,3 @@ function get(url, headers) {
 }
 
 module.exports = { fetchCommits };
-
