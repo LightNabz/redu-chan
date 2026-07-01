@@ -1,17 +1,246 @@
-require('dotenv').config();
+/**
+ * =============================================================================
+ * Combined Discord Bot — GitHub Commit Tracker + Anti-Scam OCR/Blast Detector
+ * =============================================================================
+ * Stack : discord.js v14, tesseract.js v5, node-cron, Node.js >= 18
+ *
+ * Merged from two standalone bots:
+ *   1. GitHub commit tracker  (/ping, /repo, /logchannel, "Redu-chan" easter egg)
+ *   2. Anti-phishing detector (/watch, /list, /action, /keywords, /config)
+ *
+ * Anti-phishing detection surfaces:
+ *   SURFACE A — OCR Keyword Pipeline (mention-gated)
+ *     Fires when a message contains a high-risk mention (@everyone / @here /
+ *     a watched role) AND an image attachment. Tesseract reads the image and
+ *     counts keyword hits against the per-guild keyword list. Triggers the
+ *     punishment pipeline when hits >= threshold (default 2).
+ *
+ *   SURFACE B — Cross-Channel Image Blast Detection (mention-free)
+ *     Catches bots that post silently with no mentions. Every image
+ *     attachment is fingerprinted (filename + byte-size) and logged in a
+ *     short-lived velocity store. If the same fingerprint appears in N
+ *     distinct channels within T seconds (configurable via /config), the
+ *     punishment pipeline fires regardless of mentions or OCR results.
+ *
+ * All staff controls are Slash Commands gated to Administrator at the
+ * Discord API layer — non-admins cannot see them.
+ *
+ * Required environment variables (see .env):
+ *   DISCORD_TOKEN   — bot token
+ *   GUILD_ID        — (optional) guild ID for instant slash command registration
+ * =============================================================================
+ */
 
-const { Client, GatewayIntentBits, EmbedBuilder, SlashCommandBuilder, REST, Routes } = require('discord.js');
+require('dotenv').config();
+'use strict';
+
+const {
+  Client,
+  GatewayIntentBits,
+  EmbedBuilder,
+  SlashCommandBuilder,
+  PermissionFlagsBits,
+  REST,
+  Routes,
+  InteractionType,
+} = require('discord.js');
 const cron = require('node-cron');
-const fs = require('fs');
+const Tesseract = require('tesseract.js');
 const { fetchCommits } = require('./github');
 const { db, saveDB } = require('./db');
+
+// ---------------------------------------------------------------------------
+// ACTION WEIGHT TABLE (static — not guild-configurable)
+// ---------------------------------------------------------------------------
+
+/**
+ * Maps action names to execution priority weights.
+ * Higher weight → runs first.  The ordering prevents Discord API errors:
+ *
+ *   delete  (100) — kill the message before any user clicks a link
+ *   send_dm  (80) — DM the victim while the bot still shares the guild
+ *   mute     (50) — timeout the account to stop further blasts
+ *   kick     (20) — remove from guild (must follow DM)
+ *   ban      (10) — permanent removal (always last)
+ */
+const ACTION_WEIGHTS = Object.freeze({
+  delete: 100,
+  send_dm: 80,
+  mute: 50,
+  kick: 20,
+  ban: 10,
+});
+
+// ---------------------------------------------------------------------------
+// DEFAULT SCAM KEYWORDS (used when a guild has not customised its list)
+// ---------------------------------------------------------------------------
+
+const DEFAULT_KEYWORDS = Object.freeze([
+  'mr. beast',
+  'mrbeast',
+  'promo code',
+  'dasowin',
+  'giveaway',
+  'claim',
+  'deposit',
+]);
+
+// ---------------------------------------------------------------------------
+// PER-GUILD ANTI-PHISHING CONFIG STORE
+// ---------------------------------------------------------------------------
+
+/**
+ * In-memory config store keyed by guild ID.
+ *
+ * Per-guild shape:
+ * {
+ *   watched_roles    : string[]  — role IDs that trigger the OCR pipeline
+ *   actions          : string[]  — active punishment names
+ *   keywords         : string[]  — OCR scam keywords (starts as DEFAULT_KEYWORDS copy)
+ *   keyword_threshold: number    — minimum keyword hits to fire (default 2)
+ *   blast_channels   : number    — distinct channels needed to trigger blast detection (default 3)
+ *   blast_window_ms  : number    — rolling time window for blast detection in ms (default 60 000)
+ * }
+ *
+ * Swap this Map for SQLite / Postgres / Redis for persistence across restarts.
+ */
+const guildConfigs = new Map();
+
+/**
+ * Returns a guild's anti-phishing config, initialising it with safe defaults
+ * on first access.
+ * @param {string} guildId
+ */
+function getGuildConfig(guildId) {
+  if (!guildConfigs.has(guildId)) {
+    guildConfigs.set(guildId, {
+      watched_roles: [],
+      actions: ['delete', 'send_dm', 'mute'],
+      keywords: [...DEFAULT_KEYWORDS],
+      keyword_threshold: 2,
+      blast_channels: 3,
+      blast_window_ms: 60_000,
+    });
+  }
+  return guildConfigs.get(guildId);
+}
+
+// ---------------------------------------------------------------------------
+// CROSS-CHANNEL BLAST VELOCITY STORE
+// ---------------------------------------------------------------------------
+
+/**
+ * Tracks recent image posts for cross-channel blast detection.
+ *
+ * Structure:
+ *   blastStore
+ *     └─ guildId  (Map)
+ *           └─ fingerprint  (Array of { channelId: string, messageId: string, timestamp: number })
+ *
+ * Fingerprint formula:  `${attachment.name}::${attachment.size}`
+ *
+ * Why name+size instead of a crypto hash?
+ *   • Scam selfbots re-upload the exact same binary file — name and byte-size
+ *     are deterministic and identical across every blast channel.
+ *   • Computing a SHA-256 of the downloaded image bytes would require fetching
+ *     every attachment on every message, destroying the "passive unless needed"
+ *     performance guarantee. name+size gives equivalent collision resistance
+ *     for this threat model at zero download cost.
+ *
+ * A periodic sweep (BLAST_SWEEP_INTERVAL_MS) removes entries older than the
+ * longest configured blast window to prevent unbounded memory growth.
+ */
+const blastStore = new Map();
+
+/** How often to run the stale-entry sweep (ms). */
+const BLAST_SWEEP_INTERVAL_MS = 5 * 60_000; // every 5 minutes
+
+/**
+ * Produces a cheap, collision-resistant fingerprint for an image attachment.
+ * @param {import('discord.js').Attachment} attachment
+ * @returns {string}
+ */
+function attachmentFingerprint(attachment) {
+  return `${attachment.name}::${attachment.size}`;
+}
+
+/**
+ * Records an image sighting in the blast store and returns whether the
+ * cross-channel blast threshold has been reached for this guild.
+ *
+ * @param {string} guildId
+ * @param {string} channelId
+ * @param {string} messageId
+ * @param {string} fingerprint
+ * @param {{ blast_channels: number, blast_window_ms: number }} config
+ * @returns {{ triggered: boolean, channelCount: number, sightings: Array<{channelId:string, messageId:string, timestamp:number}> }}
+ */
+function recordAndCheckBlast(guildId, channelId, messageId, fingerprint, config) {
+  const now = Date.now();
+  const cutoff = now - config.blast_window_ms;
+
+  if (!blastStore.has(guildId)) blastStore.set(guildId, new Map());
+  const guildMap = blastStore.get(guildId);
+
+  if (!guildMap.has(fingerprint)) guildMap.set(fingerprint, []);
+  const sightings = guildMap.get(fingerprint).filter(s => s.timestamp >= cutoff);
+
+  // Only record one entry per channel — a bot flooding a single channel
+  // multiple times should not inflate the unique-channel count.
+  const existingIdx = sightings.findIndex(s => s.channelId === channelId);
+  if (existingIdx === -1) {
+    sightings.push({ channelId, messageId, timestamp: now });
+  } else {
+    sightings[existingIdx].messageId = messageId;
+    sightings[existingIdx].timestamp = now;
+  }
+
+  guildMap.set(fingerprint, sightings);
+
+  const uniqueChannels = new Set(sightings.map(s => s.channelId)).size;
+  return {
+    triggered: uniqueChannels >= config.blast_channels,
+    channelCount: uniqueChannels,
+    sightings,
+  };
+}
+
+/**
+ * Sweeps the blast store, removing fingerprints whose most recent sighting is
+ * older than the longest blast window of any guild. Prevents memory leaks on
+ * long-running bots.
+ */
+function sweepBlastStore() {
+  const now = Date.now();
+  for (const [guildId, guildMap] of blastStore) {
+    const config = getGuildConfig(guildId);
+    const cutoff = now - config.blast_window_ms;
+    for (const [fingerprint, sightings] of guildMap) {
+      const fresh = sightings.filter(s => s.timestamp >= cutoff);
+      if (fresh.length === 0) {
+        guildMap.delete(fingerprint);
+      } else {
+        guildMap.set(fingerprint, fresh);
+      }
+    }
+    if (guildMap.size === 0) blastStore.delete(guildId);
+  }
+  console.log('[SWEEP] Blast store cleaned.');
+}
+
+setInterval(sweepBlastStore, BLAST_SWEEP_INTERVAL_MS);
+
+// ---------------------------------------------------------------------------
+// CLIENT
+// ---------------------------------------------------------------------------
 
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-  ]
+    GatewayIntentBits.MessageContent, // Privileged — enable in Dev Portal
+    GatewayIntentBits.GuildMembers,   // Privileged — enable in Dev Portal (mute/kick/ban)
+  ],
 });
 
 // ── Slash command definitions ──────────────────────────────────────────────
@@ -20,7 +249,8 @@ const commands = [
   // ── /ping ──
   new SlashCommandBuilder()
     .setName('ping')
-    .setDescription('Check if the bot is alive and see latency info'),
+    .setDescription('Check if the bot is alive and see latency info')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   // ── /repo ──
   new SlashCommandBuilder()
@@ -42,7 +272,8 @@ const commands = [
         .addStringOption(opt =>
           opt.setName('id')
             .setDescription('Repository ID (from /repo list)')
-            .setRequired(true))),
+            .setRequired(true)))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   // ── /logchannel ──
   new SlashCommandBuilder()
@@ -75,7 +306,101 @@ const commands = [
             .setRequired(true)))
     .addSubcommand(sub =>
       sub.setName('list')
-        .setDescription('Show all configured log channels')),
+        .setDescription('Show all configured log channels'))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+  // ── /watch add|remove <role> ──
+  new SlashCommandBuilder()
+    .setName('watch')
+    .setDescription('Manage roles that trigger the OCR pipeline.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand(sub =>
+      sub.setName('add')
+        .setDescription('Add a role to the high-risk watch list.')
+        .addRoleOption(o => o.setName('role').setDescription('Role to monitor').setRequired(true)))
+    .addSubcommand(sub =>
+      sub.setName('remove')
+        .setDescription('Remove a role from the high-risk watch list.')
+        .addRoleOption(o => o.setName('role').setDescription('Role to stop monitoring').setRequired(true))),
+
+  // ── /list (anti-phishing watched roles) ──
+  new SlashCommandBuilder()
+    .setName('watchlist')
+    .setDescription('Show currently monitored roles for the anti-phishing OCR pipeline.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+  // ── /action add|remove|list ──
+  new SlashCommandBuilder()
+    .setName('action')
+    .setDescription('Configure the active punishment pipeline.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand(sub =>
+      sub.setName('add')
+        .setDescription('Add a punishment to the pipeline.')
+        .addStringOption(o =>
+          o.setName('type').setDescription('Punishment type').setRequired(true)
+            .addChoices(
+              { name: 'delete  (weight 100)', value: 'delete' },
+              { name: 'send_dm (weight  80)', value: 'send_dm' },
+              { name: 'mute    (weight  50)', value: 'mute' },
+              { name: 'kick    (weight  20)', value: 'kick' },
+              { name: 'ban     (weight  10)', value: 'ban' },
+            )))
+    .addSubcommand(sub =>
+      sub.setName('remove')
+        .setDescription('Remove a punishment from the pipeline.')
+        .addStringOption(o =>
+          o.setName('type').setDescription('Punishment type').setRequired(true)
+            .addChoices(
+              { name: 'delete', value: 'delete' },
+              { name: 'send_dm', value: 'send_dm' },
+              { name: 'mute', value: 'mute' },
+              { name: 'kick', value: 'kick' },
+              { name: 'ban', value: 'ban' },
+            )))
+    .addSubcommand(sub =>
+      sub.setName('list')
+        .setDescription('Show the active punishments in execution order.')),
+
+  // ── /keywords add|remove|list ──
+  new SlashCommandBuilder()
+    .setName('keywords')
+    .setDescription('Manage the OCR scam keyword list for this server.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand(sub =>
+      sub.setName('add')
+        .setDescription('Add a keyword or phrase to the scam detection list.')
+        .addStringOption(o =>
+          o.setName('keyword').setDescription('Word or phrase to flag (case-insensitive)').setRequired(true)))
+    .addSubcommand(sub =>
+      sub.setName('remove')
+        .setDescription('Remove a keyword from the scam detection list.')
+        .addStringOption(o =>
+          o.setName('keyword').setDescription('Word or phrase to remove').setRequired(true)))
+    .addSubcommand(sub =>
+      sub.setName('list')
+        .setDescription('Show all active scam keywords for this server.')),
+
+  // ── /phishconfig ──
+  new SlashCommandBuilder()
+    .setName('phishconfig')
+    .setDescription('Tune anti-phishing detection thresholds.')
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+    .addSubcommand(sub =>
+      sub.setName('blast-threshold')
+        .setDescription('Set how many channels + window trigger the blast detector.')
+        .addIntegerOption(o =>
+          o.setName('channels').setDescription('Distinct channel count to trigger (default 3)')
+            .setRequired(true).setMinValue(2).setMaxValue(20))
+        .addIntegerOption(o =>
+          o.setName('seconds').setDescription('Rolling time window in seconds (default 60)')
+            .setRequired(true).setMinValue(5).setMaxValue(300)))
+    .addSubcommand(sub =>
+      sub.setName('keyword-threshold')
+        .setDescription('Set how many keyword hits are needed to trigger OCR punishment.')
+        .addIntegerOption(o =>
+          o.setName('count').setDescription('Minimum keyword hits (default 2)')
+            .setRequired(true).setMinValue(1).setMaxValue(10))),
 ].map(cmd => cmd.toJSON());
 
 // ── Bot ready ──────────────────────────────────────────────────────────────
@@ -118,6 +443,7 @@ client.once('ready', async () => {
 // ── Interaction handler ────────────────────────────────────────────────────
 
 client.on('interactionCreate', async interaction => {
+  if (interaction.type !== InteractionType.ApplicationCommand) return;
   if (!interaction.isChatInputCommand()) return;
 
   const { commandName } = interaction;
@@ -217,7 +543,6 @@ client.on('interactionCreate', async interaction => {
   if (commandName === 'logchannel') {
     const sub = interaction.options.getSubcommand();
 
-    // /logchannel set <#channel>  →  set global fallback
     if (sub === 'set') {
       const channel = interaction.options.getChannel('channel');
       db.channels['global'] = channel.id;
@@ -227,7 +552,6 @@ client.on('interactionCreate', async interaction => {
       });
     }
 
-    // /logchannel setrepo <repo_id> <#channel>  →  set repo-specific channel
     if (sub === 'setrepo') {
       const repoId = parseInt(interaction.options.getString('repo_id'));
       const channel = interaction.options.getChannel('channel');
@@ -242,7 +566,6 @@ client.on('interactionCreate', async interaction => {
       });
     }
 
-    // /logchannel unsetrepo <repo_id>  →  remove override, fall back to global
     if (sub === 'unsetrepo') {
       const repoId = parseInt(interaction.options.getString('repo_id'));
       const repo = db.repos.find(r => r.id === repoId);
@@ -263,7 +586,6 @@ client.on('interactionCreate', async interaction => {
       });
     }
 
-    // /logchannel list
     if (sub === 'list') {
       const lines = [];
 
@@ -290,37 +612,394 @@ client.on('interactionCreate', async interaction => {
       return interaction.reply({ embeds: [embed] });
     }
   }
+
+  // ── Anti-phishing commands (deferred + wrapped, matching original) ────────
+
+  if (['watch', 'watchlist', 'action', 'keywords', 'phishconfig'].includes(commandName)) {
+    if (!interaction.guild) return;
+    const config = getGuildConfig(interaction.guild.id);
+
+    await interaction.deferReply({ ephemeral: true });
+
+    try {
+      // ── /watch ─────────────────────────────────────────────────────────
+      if (commandName === 'watch') {
+        const sub = interaction.options.getSubcommand();
+        const role = interaction.options.getRole('role', true);
+
+        if (sub === 'add') {
+          if (config.watched_roles.includes(role.id))
+            return interaction.editReply(`⚠️ **${role.name}** is already on the watch list.`);
+          config.watched_roles.push(role.id);
+          return interaction.editReply(
+            `✅ **${role.name}** added to the watch list.\n` +
+            `*(@everyone and @here are always monitored.)*`
+          );
+        }
+        if (sub === 'remove') {
+          if (!config.watched_roles.includes(role.id))
+            return interaction.editReply(`⚠️ **${role.name}** is not on the watch list.`);
+          config.watched_roles = config.watched_roles.filter(id => id !== role.id);
+          return interaction.editReply(`🗑️ **${role.name}** removed from the watch list.`);
+        }
+      }
+
+      // ── /watchlist ─────────────────────────────────────────────────────
+      if (commandName === 'watchlist') {
+        if (config.watched_roles.length === 0)
+          return interaction.editReply(
+            `📋 **Hardcoded triggers:** \`@everyone\`, \`@here\`\n` +
+            `📋 **Custom roles:** *(none)*`
+          );
+        const roleList = config.watched_roles.map(id => `<@&${id}>`).join(', ');
+        return interaction.editReply(
+          `📋 **Hardcoded triggers:** \`@everyone\`, \`@here\`\n` +
+          `📋 **Custom roles:** ${roleList}`
+        );
+      }
+
+      // ── /action ────────────────────────────────────────────────────────
+      if (commandName === 'action') {
+        const sub = interaction.options.getSubcommand();
+
+        if (sub === 'list') {
+          if (config.actions.length === 0)
+            return interaction.editReply(
+              `⚙️ **Active punishments:** *(none — bot will detect but not act!)*`
+            );
+          const lines = [...config.actions]
+            .sort((a, b) => (ACTION_WEIGHTS[b] ?? 0) - (ACTION_WEIGHTS[a] ?? 0))
+            .map((act, i) => `\`${i + 1}.\` **${act}** — weight ${ACTION_WEIGHTS[act]}`)
+            .join('\n');
+          return interaction.editReply(`⚙️ **Punishment pipeline (execution order):**\n${lines}`);
+        }
+
+        const actionType = interaction.options.getString('type', true);
+
+        if (sub === 'add') {
+          if (config.actions.includes(actionType))
+            return interaction.editReply(`⚠️ \`${actionType}\` is already active.`);
+          config.actions.push(actionType);
+          return interaction.editReply(`✅ \`${actionType}\` added to the pipeline.`);
+        }
+        if (sub === 'remove') {
+          if (!config.actions.includes(actionType))
+            return interaction.editReply(`⚠️ \`${actionType}\` is not active.`);
+          config.actions = config.actions.filter(a => a !== actionType);
+          return interaction.editReply(`🗑️ \`${actionType}\` removed from the pipeline.`);
+        }
+      }
+
+      // ── /keywords ──────────────────────────────────────────────────────
+      if (commandName === 'keywords') {
+        const sub = interaction.options.getSubcommand();
+
+        if (sub === 'list') {
+          if (config.keywords.length === 0)
+            return interaction.editReply(`📝 **Keyword list is empty.** OCR scan will never match.`);
+          const formatted = config.keywords.map(k => `\`${k}\``).join(', ');
+          return interaction.editReply(
+            `📝 **Active scam keywords (${config.keywords.length}) — ` +
+            `threshold: ${config.keyword_threshold} hit(s) required:**\n${formatted}`
+          );
+        }
+
+        const keyword = interaction.options.getString('keyword', true).toLowerCase().trim();
+
+        if (!keyword)
+          return interaction.editReply(`❌ Keyword cannot be empty.`);
+
+        if (sub === 'add') {
+          if (config.keywords.includes(keyword))
+            return interaction.editReply(`⚠️ \`${keyword}\` is already in the keyword list.`);
+          config.keywords.push(keyword);
+          return interaction.editReply(
+            `✅ \`${keyword}\` added to the keyword list.\n` +
+            `*(${config.keywords.length} keyword(s) active — threshold: ${config.keyword_threshold})*`
+          );
+        }
+        if (sub === 'remove') {
+          if (!config.keywords.includes(keyword))
+            return interaction.editReply(`⚠️ \`${keyword}\` is not in the keyword list.`);
+          config.keywords = config.keywords.filter(k => k !== keyword);
+          return interaction.editReply(
+            `🗑️ \`${keyword}\` removed.\n` +
+            `*(${config.keywords.length} keyword(s) remaining)*`
+          );
+        }
+      }
+
+      // ── /phishconfig ───────────────────────────────────────────────────
+      if (commandName === 'phishconfig') {
+        const sub = interaction.options.getSubcommand();
+
+        if (sub === 'blast-threshold') {
+          const channels = interaction.options.getInteger('channels', true);
+          const seconds = interaction.options.getInteger('seconds', true);
+          config.blast_channels = channels;
+          config.blast_window_ms = seconds * 1000;
+          return interaction.editReply(
+            `✅ **Blast detector updated:**\n` +
+            `• Triggers when the same image appears in **${channels} distinct channels**\n` +
+            `• within a **${seconds}-second** rolling window.`
+          );
+        }
+
+        if (sub === 'keyword-threshold') {
+          const count = interaction.options.getInteger('count', true);
+          config.keyword_threshold = count;
+          return interaction.editReply(
+            `✅ **OCR keyword threshold set to ${count}.**\n` +
+            `At least **${count}** keyword(s) must appear in an image to trigger punishment.\n` +
+            `*(${config.keywords.length} keyword(s) currently active.)*`
+          );
+        }
+      }
+    } catch (err) {
+      console.error(`[COMMAND ERROR] /${commandName}:`, err);
+      try {
+        await interaction.editReply('❌ An internal error occurred. Check bot logs.');
+      } catch { /* interaction may have already expired */ }
+    }
+  }
 });
 
-// ── Message listener (Redu-chan easter egg) ────────────────────────────────
+// ── Message listener (Redu-chan easter egg + anti-phishing detection) ──────
 
 client.on('messageCreate', async message => {
   if (message.author.bot) return;
 
-  const mentionsBot = message.mentions.has(client.user);
-  const content = message.content;
+  // ── Redu-chan easter egg (works everywhere, including DMs) ──
+  const isDirectMention = message.mentions.users.has(client.user.id);
+  const isRoleMention = message.guild
+    ? message.mentions.roles.some(role => message.guild.members.me.roles.cache.has(role.id))
+    : false;
   const namePattern = /\bredu(?:-chan)?\b/i;
 
-  if (mentionsBot || namePattern.test(content)) {
+  if (isDirectMention || isRoleMention || namePattern.test(message.content)) {
     const replies = [
-      'What? do you need anything?',
-      'Hmm? Did you call me?',
-      'Yes? I\'m here~',
-      'You called?',
+      'W-What? It\'s not like I was waiting for you to ping me or anything! What do you want?',
+      'Hmph! You\'re always interrupting me... What is it this time?',
+      'Ugh, don\'t just call my name so casually, baka! ...But fine, what do you need?',
+      'A-Ah! Don\'t startle me like that! ...It\'s not like I mind, but you better have a good reason!',
     ];
     const reply = replies[Math.floor(Math.random() * replies.length)];
     await message.reply(reply);
   }
+
+  // ── Anti-phishing detection (guild-only, image-only) ──
+  if (!message.guild) return;
+
+  const imageAttachments = message.attachments.filter(
+    att => att.contentType?.startsWith('image/')
+  );
+  if (imageAttachments.size === 0) return;
+
+  const config = getGuildConfig(message.guild.id);
+
+  // ── SURFACE B: Cross-channel blast detector ────────────────────────────
+  for (const [, attachment] of imageAttachments) {
+    const fp = attachmentFingerprint(attachment);
+    const { triggered, channelCount, sightings } = recordAndCheckBlast(
+      message.guild.id,
+      message.channel.id,
+      message.id,
+      fp,
+      config
+    );
+
+    if (triggered) {
+      console.log(
+        `[BLAST DETECTED] Fingerprint "${fp}" seen in ${channelCount} channels ` +
+        `within ${config.blast_window_ms / 1000}s window. ` +
+        `Author: ${message.author.tag} in "${message.guild.name}".`
+      );
+
+      // ── Delete ALL blast copies, not just the triggering message ───
+      const priorSightings = sightings.filter(s => s.messageId !== message.id);
+      if (priorSightings.length > 0) {
+        console.log(
+          `[BLAST CLEANUP] Deleting ${priorSightings.length} prior blast message(s)...`
+        );
+        await Promise.allSettled(
+          priorSightings.map(async ({ channelId, messageId }) => {
+            try {
+              const channel = await message.guild.channels.fetch(channelId);
+              const msg = await channel.messages.fetch(messageId);
+              if (msg.deletable) {
+                await msg.delete();
+                console.log(
+                  `[BLAST CLEANUP] ✓ Deleted prior message ${messageId} ` +
+                  `from channel ${channelId}`
+                );
+              }
+            } catch (err) {
+              console.warn(
+                `[BLAST CLEANUP] ✗ Could not delete message ${messageId} ` +
+                `in channel ${channelId}: ${err.message}`
+              );
+            }
+          })
+        );
+      }
+
+      // Run the standard pipeline on the triggering message.
+      await executePunishmentPipeline(message, config.actions, 'Cross-Channel Image Blast');
+
+      // Clear the fingerprint so subsequent channel posts in the same
+      // burst don't re-trigger the pipeline a second time.
+      blastStore.get(message.guild.id)?.delete(fp);
+      return; // skip OCR — punishment already dispatched
+    }
+  }
+
+  // ── SURFACE A: OCR keyword pipeline ───────────────────────────────────
+
+  const mentionsEveryone = message.content.includes('@everyone');
+  const mentionsHere = message.content.includes('@here');
+  const mentionsWatchedRole = message.mentions.roles.some(
+    role => config.watched_roles.includes(role.id)
+  );
+
+  if (!mentionsEveryone && !mentionsHere && !mentionsWatchedRole) return;
+
+  console.log(
+    `[OCR TRIGGERED] High-risk mention + image from ${message.author.tag} ` +
+    `in "${message.guild.name}" — scanning ${imageAttachments.size} image(s)...`
+  );
+
+  try {
+    for (const [, attachment] of imageAttachments) {
+      const { data: { text } } = await Tesseract.recognize(attachment.url, 'eng', {
+        logger: () => {}, // suppress verbose Tesseract progress logs
+      });
+
+      const cleanText = text.toLowerCase();
+      const matchedKeywords = config.keywords.filter(kw => cleanText.includes(kw));
+
+      console.log(
+        `[OCR RESULT] "${attachment.name}": ` +
+        `${matchedKeywords.length} hit(s) [${matchedKeywords.join(', ')}]`
+      );
+
+      if (matchedKeywords.length >= config.keyword_threshold) {
+        console.log(
+          `[OCR MATCH] Threshold met (${matchedKeywords.length} >= ` +
+          `${config.keyword_threshold}). Triggering pipeline for ${message.author.tag}.`
+        );
+        await executePunishmentPipeline(message, config.actions, 'OCR Keyword Match');
+        break; // one confirmed match per message is sufficient
+      }
+    }
+  } catch (err) {
+    console.error(`[ERROR] OCR pipeline error on message ${message.id}:`, err);
+  }
 });
 
-// ── Polling logic ──────────────────────────────────────────────────────────
+// ── Punishment pipeline (anti-phishing) ─────────────────────────────────────
+
+/**
+ * Sorts active actions by weight (highest first) and executes each one,
+ * catching errors per-action so a single failure never aborts the sequence.
+ *
+ * @param {import('discord.js').Message} message
+ * @param {string[]} activeActions
+ * @param {string} triggerReason  — logged to console for audit trail
+ */
+async function executePunishmentPipeline(message, activeActions, triggerReason) {
+  const { guild, member, author } = message;
+
+  const sortedActions = [...activeActions].sort(
+    (a, b) => (ACTION_WEIGHTS[b] ?? 0) - (ACTION_WEIGHTS[a] ?? 0)
+  );
+
+  console.log(
+    `[PIPELINE] Reason: "${triggerReason}" | ` +
+    `User: ${author.tag} | ` +
+    `Sequence: [${sortedActions.join(' → ')}]`
+  );
+
+  for (const action of sortedActions) {
+    try {
+      switch (action) {
+
+        case 'delete':
+          if (message.deletable) {
+            await message.delete();
+            console.log(`[ACTION] ✓ Deleted message (ID: ${message.id})`);
+          } else {
+            console.warn(`[ACTION] ✗ Message not deletable — missing Manage Messages?`);
+          }
+          break;
+
+        case 'send_dm':
+          try {
+            await author.send(
+              `⚠️ **Security Alert from ${guild.name}**\n\n` +
+              `Your account was flagged for posting a phishing image ` +
+              `(detection reason: **${triggerReason}**).\n\n` +
+              `**Your account token may be compromised.** A session hijacker ` +
+              `may be posting through your account without your knowledge.\n\n` +
+              `**Take action immediately:**\n` +
+              `1. Go to **User Settings → Privacy & Safety → Change Password**\n` +
+              `2. Changing your password invalidates all active sessions\n` +
+              `3. Enable **Two-Factor Authentication** if not already active\n\n` +
+              `To report this to Discord: https://dis.gd/report`
+            );
+            console.log(`[ACTION] ✓ Security DM sent to ${author.tag}`);
+          } catch {
+            console.warn(`[ACTION] ✗ Could not DM ${author.tag} — DMs are closed.`);
+          }
+          break;
+
+        case 'mute':
+          if (member?.moderatable) {
+            await member.timeout(24 * 60 * 60 * 1000, `Automated: ${triggerReason}`);
+            console.log(`[ACTION] ✓ 24-hour timeout applied to ${author.tag}`);
+          } else {
+            console.warn(`[ACTION] ✗ Cannot timeout ${author.tag} — not moderatable.`);
+          }
+          break;
+
+        case 'kick':
+          if (member?.kickable) {
+            await member.kick(`Automated: ${triggerReason}`);
+            console.log(`[ACTION] ✓ Kicked ${author.tag}`);
+          } else {
+            console.warn(`[ACTION] ✗ Cannot kick ${author.tag} — not kickable.`);
+          }
+          break;
+
+        case 'ban':
+          if (member?.bannable) {
+            await guild.members.ban(author.id, {
+              reason: `Automated: ${triggerReason}`,
+              deleteMessageSeconds: 0,
+            });
+            console.log(`[ACTION] ✓ Permanently banned ${author.tag}`);
+          } else {
+            console.warn(`[ACTION] ✗ Cannot ban ${author.tag} — not bannable.`);
+          }
+          break;
+
+        default:
+          console.warn(`[PIPELINE] Unknown action "${action}" — skipping.`);
+      }
+    } catch (apiErr) {
+      console.error(
+        `[ACTION ERROR] "${action}" failed for ${author.tag}:`, apiErr.message
+      );
+    }
+  }
+}
+
+// ── GitHub polling logic ────────────────────────────────────────────────────
 
 async function pollCommits(client) {
   for (const repo of db.repos) {
     try {
       const { newCommits, latestSHA } = await fetchCommits(repo.owner, repo.repo, repo.lastSHA);
 
-      // Always persist the latest SHA so the next poll knows where to start
       if (latestSHA && latestSHA !== repo.lastSHA) {
         repo.lastSHA = latestSHA;
         saveDB();
@@ -334,7 +1013,6 @@ async function pollCommits(client) {
       const channel = await client.channels.fetch(channelId).catch(() => null);
       if (!channel) continue;
 
-      // Send newest-last so they appear chronologically
       for (const commit of newCommits.reverse()) {
         const embed = buildCommitEmbed(repo, commit);
         await channel.send({ embeds: [embed] });

@@ -1,26 +1,40 @@
 {
-  "nextId": 3,
+  "nextId": 5,
   "repos": [
     {
       "id": 1,
       "owner": "LightNabz",
       "repo": "fin",
       "url": "https://github.com/LightNabz/fin",
-      "lastSHA": null
+      "lastSHA": "3be25191648a88a0f83a68b1a2e2f37cccddf056"
     },
     {
       "id": 2,
       "owner": "LightNabz",
       "repo": "LightNabz.github.io",
       "url": "https://github.com/LightNabz/LightNabz.github.io",
-      "lastSHA": null
+      "lastSHA": "c55007dba5865b0e48178cc10ac491eb583aed40"
     },
     {
       "id": 3,
       "owner": "LightNabz",
       "repo": "redu-chan",
       "url": "https://github.com/LightNabz/redu-chan",
-      "lastSHA": null
+      "lastSHA": "7a3552087c47acce236f22a4759e6da0f1144d60"
+    },
+    {
+      "id": 4,
+      "owner": "end-4",
+      "repo": "dots-hyprland",
+      "url": "https://github.com/end-4/dots-hyprland",
+      "lastSHA": "c04b0bbc8143a2b2166c1f699f7583cb28ff78fe"
+    },
+    {
+      "id": 5,
+      "owner": "torvalds",
+      "repo": "linux",
+      "url": "https://github.com/torvalds/linux",
+      "lastSHA": "665159e246749578d4e4bfe106ee3b74edcdab18"
     }
   ],
   "channels": {
