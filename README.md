@@ -1,4 +1,4 @@
-# Redu-chan 🤖
+# Redu-chan :3
 
 A single Discord bot that does two unrelated jobs well:
 
