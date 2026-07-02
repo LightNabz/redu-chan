@@ -43,11 +43,12 @@ const {
   REST,
   Routes,
   InteractionType,
+  ActivityType,
 } = require('discord.js');
 const cron = require('node-cron');
 const Tesseract = require('tesseract.js');
 const { fetchCommits } = require('./github');
-const { db, saveDB } = require('./db');
+const { db, saveDB, getGuildDB, getPhishingConfig } = require('./db');
 
 // ---------------------------------------------------------------------------
 // ACTION WEIGHT TABLE (static — not guild-configurable)
@@ -72,58 +73,13 @@ const ACTION_WEIGHTS = Object.freeze({
 });
 
 // ---------------------------------------------------------------------------
-// DEFAULT SCAM KEYWORDS (used when a guild has not customised its list)
+// PER-GUILD ANTI-PHISHING CONFIG
 // ---------------------------------------------------------------------------
-
-const DEFAULT_KEYWORDS = Object.freeze([
-  'mr. beast',
-  'mrbeast',
-  'promo code',
-  'dasowin',
-  'giveaway',
-  'claim',
-  'deposit',
-]);
-
-// ---------------------------------------------------------------------------
-// PER-GUILD ANTI-PHISHING CONFIG STORE
-// ---------------------------------------------------------------------------
-
-/**
- * In-memory config store keyed by guild ID.
- *
- * Per-guild shape:
- * {
- *   watched_roles    : string[]  — role IDs that trigger the OCR pipeline
- *   actions          : string[]  — active punishment names
- *   keywords         : string[]  — OCR scam keywords (starts as DEFAULT_KEYWORDS copy)
- *   keyword_threshold: number    — minimum keyword hits to fire (default 2)
- *   blast_channels   : number    — distinct channels needed to trigger blast detection (default 3)
- *   blast_window_ms  : number    — rolling time window for blast detection in ms (default 60 000)
- * }
- *
- * Swap this Map for SQLite / Postgres / Redis for persistence across restarts.
- */
-const guildConfigs = new Map();
-
-/**
- * Returns a guild's anti-phishing config, initialising it with safe defaults
- * on first access.
- * @param {string} guildId
- */
-function getGuildConfig(guildId) {
-  if (!guildConfigs.has(guildId)) {
-    guildConfigs.set(guildId, {
-      watched_roles: [],
-      actions: ['delete', 'send_dm', 'mute'],
-      keywords: [...DEFAULT_KEYWORDS],
-      keyword_threshold: 2,
-      blast_channels: 3,
-      blast_window_ms: 60_000,
-    });
-  }
-  return guildConfigs.get(guildId);
-}
+//
+// Anti-phishing config (watched_roles, actions, keywords, keyword_threshold,
+// blast_channels, blast_window_ms, log_channel) now lives in db.js alongside
+// the GitHub tracker data, persisted to data.json via getPhishingConfig() /
+// saveDB(). It survives restarts, unlike the old in-memory Map.
 
 // ---------------------------------------------------------------------------
 // CROSS-CHANNEL BLAST VELOCITY STORE
@@ -213,7 +169,7 @@ function recordAndCheckBlast(guildId, channelId, messageId, fingerprint, config)
 function sweepBlastStore() {
   const now = Date.now();
   for (const [guildId, guildMap] of blastStore) {
-    const config = getGuildConfig(guildId);
+    const config = getPhishingConfig(guildId);
     const cutoff = now - config.blast_window_ms;
     for (const [fingerprint, sightings] of guildMap) {
       const fresh = sightings.filter(s => s.timestamp >= cutoff);
@@ -387,6 +343,11 @@ const commands = [
     .setDescription('Tune anti-phishing detection thresholds.')
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
     .addSubcommand(sub =>
+      sub.setName('log-channel')
+        .setDescription('Set the channel where phishing detections are logged.')
+        .addChannelOption(o =>
+          o.setName('channel').setDescription('Channel to post detection logs to').setRequired(true)))
+    .addSubcommand(sub =>
       sub.setName('blast-threshold')
         .setDescription('Set how many channels + window trigger the blast detector.')
         .addIntegerOption(o =>
@@ -423,21 +384,46 @@ client.once('ready', async () => {
       console.error('[ERR] Failed to register guild commands:', err.message);
       console.error('      Make sure the bot was invited with the applications.commands scope.');
     }
-  } else {
-    // Global: can take up to 1 hour to propagate across Discord
-    try {
-      await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
-      console.log('[OK] Slash commands registered globally (may take up to 1 hour to appear)');
-      console.log('     Tip: set GUILD_ID=your_server_id for instant registration');
-    } catch (err) {
-      console.error('[ERR] Failed to register global commands:', err.message);
-      console.error('      Make sure the bot was invited with the applications.commands scope.');
-    }
+  }
+
+  // Global: reaches every server the bot is in, but can take up to
+  // 1 hour to propagate. Always runs, regardless of GUILD_ID, so
+  // servers other than the dev/test guild actually get commands too.
+  try {
+    await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+    console.log('[OK] Slash commands registered globally (may take up to 1 hour to appear)');
+  } catch (err) {
+    console.error('[ERR] Failed to register global commands:', err.message);
+    console.error('      Make sure the bot was invited with the applications.commands scope.');
   }
 
   // Start polling every 5 minutes
   cron.schedule('*/5 * * * *', () => pollCommits(client));
   console.log('[OK] Polling GitHub every 5 minutes');
+
+  // ── Bot presence / status ──────────────────────────────────────────────
+  // Rotates through a few statuses so the bot doesn't look idle/dead in
+  // the member list, and gives a quick at-a-glance sense of what it does.
+  const presences = [
+    { name: 'for phishing scams', type: ActivityType.Watching },
+    { name: `${client.guilds.cache.size} server${client.guilds.cache.size === 1 ? '' : 's'}`, type: ActivityType.Watching },
+    { name: 'GitHub commits', type: ActivityType.Watching },
+    { name: '/watch, /keywords, /action', type: ActivityType.Listening },
+  ];
+  let presenceIndex = 0;
+
+  function cyclePresence() {
+    const { name, type } = presences[presenceIndex % presences.length];
+    client.user.setPresence({
+      activities: [{ name, type }],
+      status: 'online',
+    });
+    presenceIndex++;
+  }
+
+  cyclePresence();
+  setInterval(cyclePresence, 30_000); // rotate every 30 seconds
+  console.log('[OK] Presence rotation started');
 });
 
 // ── Interaction handler ────────────────────────────────────────────────────
@@ -451,6 +437,11 @@ client.on('interactionCreate', async interaction => {
   // ── /ping ────────────────────────────────────────────────────────────────
 
   if (commandName === 'ping') {
+    if (!interaction.guild) {
+      return interaction.reply({ content: '❌ This command must be used in a server.', ephemeral: true });
+    }
+    const gdb = getGuildDB(interaction.guild.id);
+
     const sent = await interaction.reply({ content: '🏓 Pinging...', fetchReply: true });
     const roundtrip = sent.createdTimestamp - interaction.createdTimestamp;
     const wsHeartbeat = client.ws.ping;
@@ -461,7 +452,7 @@ client.on('interactionCreate', async interaction => {
       .addFields(
         { name: '↩️ Roundtrip', value: `\`${roundtrip}ms\``, inline: true },
         { name: '💓 WS Heartbeat', value: `\`${wsHeartbeat}ms\``, inline: true },
-        { name: '📦 Repos tracked', value: `\`${db.repos.length}\``, inline: true },
+        { name: '📦 Repos tracked', value: `\`${gdb.repos.length}\``, inline: true },
       )
       .setFooter({ text: `Shard ${client.ws.shards.first()?.id ?? 0}` })
       .setTimestamp();
@@ -472,6 +463,10 @@ client.on('interactionCreate', async interaction => {
   // ── /repo ─────────────────────────────────────────────────────────────────
 
   if (commandName === 'repo') {
+    if (!interaction.guild) {
+      return interaction.reply({ content: '❌ This command must be used in a server.', ephemeral: true });
+    }
+    const gdb = getGuildDB(interaction.guild.id);
     const sub = interaction.options.getSubcommand();
 
     if (sub === 'add') {
@@ -481,13 +476,13 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({ content: '❌ Invalid GitHub URL. Use `https://github.com/owner/repo`', ephemeral: true });
       }
 
-      const existing = db.repos.find(r => r.owner === parsed.owner && r.repo === parsed.repo);
+      const existing = gdb.repos.find(r => r.owner === parsed.owner && r.repo === parsed.repo);
       if (existing) {
         return interaction.reply({ content: `⚠️ That repo is already tracked as **#${existing.id}**.`, ephemeral: true });
       }
 
-      const id = ++db.nextId;
-      db.repos.push({ id, owner: parsed.owner, repo: parsed.repo, url, lastSHA: null });
+      const id = ++gdb.nextId;
+      gdb.repos.push({ id, owner: parsed.owner, repo: parsed.repo, url, lastSHA: null });
       saveDB();
 
       const embed = new EmbedBuilder()
@@ -503,7 +498,7 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (sub === 'list') {
-      if (!db.repos.length) {
+      if (!gdb.repos.length) {
         return interaction.reply({ content: '📭 No repositories tracked yet. Use `/repo add` to get started.', ephemeral: true });
       }
 
@@ -511,8 +506,8 @@ client.on('interactionCreate', async interaction => {
         .setColor(0x0d1117)
         .setTitle('📋 Tracked Repositories')
         .setDescription(
-          db.repos.map(r => {
-            const channel = db.channels[`repo_${r.id}`] || db.channels['global'];
+          gdb.repos.map(r => {
+            const channel = gdb.channels[`repo_${r.id}`] || gdb.channels['global'];
             const channelStr = channel ? `<#${channel}>` : '*(no channel set)*';
             return `**#${r.id}** — [${r.owner}/${r.repo}](${r.url}) → ${channelStr}`;
           }).join('\n')
@@ -523,13 +518,13 @@ client.on('interactionCreate', async interaction => {
 
     if (sub === 'remove') {
       const id = parseInt(interaction.options.getString('id'));
-      const idx = db.repos.findIndex(r => r.id === id);
+      const idx = gdb.repos.findIndex(r => r.id === id);
       if (idx === -1) {
         return interaction.reply({ content: `❌ No repository with ID \`${id}\`.`, ephemeral: true });
       }
 
-      const [removed] = db.repos.splice(idx, 1);
-      delete db.channels[`repo_${id}`];
+      const [removed] = gdb.repos.splice(idx, 1);
+      delete gdb.channels[`repo_${id}`];
       saveDB();
 
       return interaction.reply({
@@ -541,11 +536,15 @@ client.on('interactionCreate', async interaction => {
   // ── /logchannel ───────────────────────────────────────────────────────────
 
   if (commandName === 'logchannel') {
+    if (!interaction.guild) {
+      return interaction.reply({ content: '❌ This command must be used in a server.', ephemeral: true });
+    }
+    const gdb = getGuildDB(interaction.guild.id);
     const sub = interaction.options.getSubcommand();
 
     if (sub === 'set') {
       const channel = interaction.options.getChannel('channel');
-      db.channels['global'] = channel.id;
+      gdb.channels['global'] = channel.id;
       saveDB();
       return interaction.reply({
         content: `✅ Global log channel set to <#${channel.id}>. All repos without a specific channel will log here.`,
@@ -555,11 +554,11 @@ client.on('interactionCreate', async interaction => {
     if (sub === 'setrepo') {
       const repoId = parseInt(interaction.options.getString('repo_id'));
       const channel = interaction.options.getChannel('channel');
-      const repo = db.repos.find(r => r.id === repoId);
+      const repo = gdb.repos.find(r => r.id === repoId);
       if (!repo) {
         return interaction.reply({ content: `❌ No repository with ID \`${repoId}\`.`, ephemeral: true });
       }
-      db.channels[`repo_${repoId}`] = channel.id;
+      gdb.channels[`repo_${repoId}`] = channel.id;
       saveDB();
       return interaction.reply({
         content: `✅ Commit logs for **${repo.owner}/${repo.repo}** will be sent to <#${channel.id}>.`,
@@ -568,16 +567,16 @@ client.on('interactionCreate', async interaction => {
 
     if (sub === 'unsetrepo') {
       const repoId = parseInt(interaction.options.getString('repo_id'));
-      const repo = db.repos.find(r => r.id === repoId);
+      const repo = gdb.repos.find(r => r.id === repoId);
       if (!repo) {
         return interaction.reply({ content: `❌ No repository with ID \`${repoId}\`.`, ephemeral: true });
       }
-      if (!db.channels[`repo_${repoId}`]) {
+      if (!gdb.channels[`repo_${repoId}`]) {
         return interaction.reply({ content: `⚠️ **${repo.owner}/${repo.repo}** doesn't have a specific channel set — it's already using the global channel.`, ephemeral: true });
       }
-      delete db.channels[`repo_${repoId}`];
+      delete gdb.channels[`repo_${repoId}`];
       saveDB();
-      const globalChannel = db.channels['global'];
+      const globalChannel = gdb.channels['global'];
       const fallback = globalChannel
         ? ` It will now fall back to the global channel <#${globalChannel}>.`
         : ' No global channel is configured yet — set one with `/logchannel set`.';
@@ -589,17 +588,17 @@ client.on('interactionCreate', async interaction => {
     if (sub === 'list') {
       const lines = [];
 
-      if (db.channels['global']) {
-        lines.push(`🌐 **Global fallback** → <#${db.channels['global']}>`);
+      if (gdb.channels['global']) {
+        lines.push(`🌐 **Global fallback** → <#${gdb.channels['global']}>`);
       } else {
         lines.push('🌐 **Global fallback** → *(not set)*');
       }
 
-      if (db.repos.length) {
+      if (gdb.repos.length) {
         lines.push('');
-        for (const repo of db.repos) {
+        for (const repo of gdb.repos) {
           const key = `repo_${repo.id}`;
-          const channelStr = db.channels[key] ? `<#${db.channels[key]}>` : '*(uses global)*';
+          const channelStr = gdb.channels[key] ? `<#${gdb.channels[key]}>` : '*(uses global)*';
           lines.push(`📦 **#${repo.id}** \`${repo.owner}/${repo.repo}\` → ${channelStr}`);
         }
       }
@@ -617,7 +616,7 @@ client.on('interactionCreate', async interaction => {
 
   if (['watch', 'watchlist', 'action', 'keywords', 'phishconfig'].includes(commandName)) {
     if (!interaction.guild) return;
-    const config = getGuildConfig(interaction.guild.id);
+    const config = getPhishingConfig(interaction.guild.id);
 
     await interaction.deferReply({ ephemeral: true });
 
@@ -631,6 +630,7 @@ client.on('interactionCreate', async interaction => {
           if (config.watched_roles.includes(role.id))
             return interaction.editReply(`⚠️ **${role.name}** is already on the watch list.`);
           config.watched_roles.push(role.id);
+          saveDB();
           return interaction.editReply(
             `✅ **${role.name}** added to the watch list.\n` +
             `*(@everyone and @here are always monitored.)*`
@@ -640,6 +640,7 @@ client.on('interactionCreate', async interaction => {
           if (!config.watched_roles.includes(role.id))
             return interaction.editReply(`⚠️ **${role.name}** is not on the watch list.`);
           config.watched_roles = config.watched_roles.filter(id => id !== role.id);
+          saveDB();
           return interaction.editReply(`🗑️ **${role.name}** removed from the watch list.`);
         }
       }
@@ -680,12 +681,14 @@ client.on('interactionCreate', async interaction => {
           if (config.actions.includes(actionType))
             return interaction.editReply(`⚠️ \`${actionType}\` is already active.`);
           config.actions.push(actionType);
+          saveDB();
           return interaction.editReply(`✅ \`${actionType}\` added to the pipeline.`);
         }
         if (sub === 'remove') {
           if (!config.actions.includes(actionType))
             return interaction.editReply(`⚠️ \`${actionType}\` is not active.`);
           config.actions = config.actions.filter(a => a !== actionType);
+          saveDB();
           return interaction.editReply(`🗑️ \`${actionType}\` removed from the pipeline.`);
         }
       }
@@ -713,6 +716,7 @@ client.on('interactionCreate', async interaction => {
           if (config.keywords.includes(keyword))
             return interaction.editReply(`⚠️ \`${keyword}\` is already in the keyword list.`);
           config.keywords.push(keyword);
+          saveDB();
           return interaction.editReply(
             `✅ \`${keyword}\` added to the keyword list.\n` +
             `*(${config.keywords.length} keyword(s) active — threshold: ${config.keyword_threshold})*`
@@ -722,6 +726,7 @@ client.on('interactionCreate', async interaction => {
           if (!config.keywords.includes(keyword))
             return interaction.editReply(`⚠️ \`${keyword}\` is not in the keyword list.`);
           config.keywords = config.keywords.filter(k => k !== keyword);
+          saveDB();
           return interaction.editReply(
             `🗑️ \`${keyword}\` removed.\n` +
             `*(${config.keywords.length} keyword(s) remaining)*`
@@ -733,11 +738,19 @@ client.on('interactionCreate', async interaction => {
       if (commandName === 'phishconfig') {
         const sub = interaction.options.getSubcommand();
 
+        if (sub === 'log-channel') {
+          const channel = interaction.options.getChannel('channel', true);
+          config.log_channel = channel.id;
+          saveDB();
+          return interaction.editReply(`✅ Phishing detections will now be logged to <#${channel.id}>.`);
+        }
+
         if (sub === 'blast-threshold') {
           const channels = interaction.options.getInteger('channels', true);
           const seconds = interaction.options.getInteger('seconds', true);
           config.blast_channels = channels;
           config.blast_window_ms = seconds * 1000;
+          saveDB();
           return interaction.editReply(
             `✅ **Blast detector updated:**\n` +
             `• Triggers when the same image appears in **${channels} distinct channels**\n` +
@@ -748,6 +761,7 @@ client.on('interactionCreate', async interaction => {
         if (sub === 'keyword-threshold') {
           const count = interaction.options.getInteger('count', true);
           config.keyword_threshold = count;
+          saveDB();
           return interaction.editReply(
             `✅ **OCR keyword threshold set to ${count}.**\n` +
             `At least **${count}** keyword(s) must appear in an image to trigger punishment.\n` +
@@ -795,7 +809,7 @@ client.on('messageCreate', async message => {
   );
   if (imageAttachments.size === 0) return;
 
-  const config = getGuildConfig(message.guild.id);
+  const config = getPhishingConfig(message.guild.id);
 
   // ── SURFACE B: Cross-channel blast detector ────────────────────────────
   for (const [, attachment] of imageAttachments) {
@@ -807,50 +821,70 @@ client.on('messageCreate', async message => {
       fp,
       config
     );
+if (triggered) {
+  console.log(
+    `[BLAST DETECTED] Fingerprint "${fp}" seen in ${channelCount} channels ` +
+    `within ${config.blast_window_ms / 1000}s window. ` +
+    `Author: ${message.author.tag} in "${message.guild.name}". Running OCR confirmation...`
+  );
 
-    if (triggered) {
-      console.log(
-        `[BLAST DETECTED] Fingerprint "${fp}" seen in ${channelCount} channels ` +
-        `within ${config.blast_window_ms / 1000}s window. ` +
-        `Author: ${message.author.tag} in "${message.guild.name}".`
-      );
+  // ── Confirm with OCR before punishing — a fast multi-channel repost
+  // alone is only a behavioral signal, not proof of phishing content. ──
+  let confirmed = false;
+  try {
+    const { data: { text } } = await Tesseract.recognize(attachment.url, 'eng', {
+      logger: () => {},
+    });
+    const cleanText = text.toLowerCase();
+    const matchedKeywords = config.keywords.filter(kw => cleanText.includes(kw));
+    confirmed = matchedKeywords.length >= config.keyword_threshold;
+    console.log(
+      `[BLAST OCR] "${attachment.name}": ${matchedKeywords.length} hit(s) ` +
+      `[${matchedKeywords.join(', ')}] — ${confirmed ? 'CONFIRMED' : 'not confirmed, ignoring'}`
+    );
+  } catch (err) {
+    console.error(`[BLAST OCR ERROR] Could not scan ${attachment.name}:`, err.message);
+  }
 
-      // ── Delete ALL blast copies, not just the triggering message ───
-      const priorSightings = sightings.filter(s => s.messageId !== message.id);
-      if (priorSightings.length > 0) {
-        console.log(
-          `[BLAST CLEANUP] Deleting ${priorSightings.length} prior blast message(s)...`
-        );
-        await Promise.allSettled(
-          priorSightings.map(async ({ channelId, messageId }) => {
-            try {
-              const channel = await message.guild.channels.fetch(channelId);
-              const msg = await channel.messages.fetch(messageId);
-              if (msg.deletable) {
-                await msg.delete();
-                console.log(
-                  `[BLAST CLEANUP] ✓ Deleted prior message ${messageId} ` +
-                  `from channel ${channelId}`
-                );
-              }
-            } catch (err) {
-              console.warn(
-                `[BLAST CLEANUP] ✗ Could not delete message ${messageId} ` +
-                `in channel ${channelId}: ${err.message}`
-              );
-            }
-          })
-        );
-      }
+  if (!confirmed) {
+    // Regular image, just posted fast — clear the fingerprint and move on.
+    // No delete, no DM, no punishment.
+    blastStore.get(message.guild.id)?.delete(fp);
+    continue;
+  }
 
-      // Run the standard pipeline on the triggering message.
-      await executePunishmentPipeline(message, config.actions, 'Cross-Channel Image Blast');
+  // ── Delete ALL blast copies, not just the triggering message ───
+  const priorSightings = sightings.filter(s => s.messageId !== message.id);
+  if (priorSightings.length > 0) {
+    console.log(
+      `[BLAST CLEANUP] Deleting ${priorSightings.length} prior blast message(s)...`
+    );
+    await Promise.allSettled(
+      priorSightings.map(async ({ channelId, messageId }) => {
+        try {
+          const channel = await message.guild.channels.fetch(channelId);
+          const msg = await channel.messages.fetch(messageId);
+          if (msg.deletable) {
+            await msg.delete();
+            console.log(
+              `[BLAST CLEANUP] ✓ Deleted prior message ${messageId} ` +
+              `from channel ${channelId}`
+            );
+          }
+        } catch (err) {
+          console.warn(
+            `[BLAST CLEANUP] ✗ Could not delete message ${messageId} ` +
+            `in channel ${channelId}: ${err.message}`
+          );
+        }
+      })
+    );
+  }
 
-      // Clear the fingerprint so subsequent channel posts in the same
-      // burst don't re-trigger the pipeline a second time.
-      blastStore.get(message.guild.id)?.delete(fp);
-      return; // skip OCR — punishment already dispatched
-    }
+  await executePunishmentPipeline(message, config.actions, 'Cross-Channel Image Blast', config);
+  blastStore.get(message.guild.id)?.delete(fp);
+  return;
+}
   }
 
   // ── SURFACE A: OCR keyword pipeline ───────────────────────────────────
@@ -887,7 +921,7 @@ client.on('messageCreate', async message => {
           `[OCR MATCH] Threshold met (${matchedKeywords.length} >= ` +
           `${config.keyword_threshold}). Triggering pipeline for ${message.author.tag}.`
         );
-        await executePunishmentPipeline(message, config.actions, 'OCR Keyword Match');
+        await executePunishmentPipeline(message, config.actions, 'OCR Keyword Match', config);
         break; // one confirmed match per message is sufficient
       }
     }
@@ -906,7 +940,7 @@ client.on('messageCreate', async message => {
  * @param {string[]} activeActions
  * @param {string} triggerReason  — logged to console for audit trail
  */
-async function executePunishmentPipeline(message, activeActions, triggerReason) {
+async function executePunishmentPipeline(message, activeActions, triggerReason, config) {
   const { guild, member, author } = message;
 
   const sortedActions = [...activeActions].sort(
@@ -991,34 +1025,55 @@ async function executePunishmentPipeline(message, activeActions, triggerReason) 
       );
     }
   }
+
+   if (config?.log_channel) {
+    const logChannel = await guild.channels.fetch(config.log_channel).catch(() => null);
+    if (logChannel) {
+      const embed = new EmbedBuilder()
+        .setColor(0xF85149)
+        .setTitle('🚨 Phishing Detection')
+        .addFields(
+          { name: 'User', value: `${author.tag} (${author.id})`, inline: true },
+          { name: 'Reason', value: triggerReason, inline: true },
+          { name: 'Actions taken', value: sortedActions.join(', ') || '*(none configured)*' },
+          { name: 'Channel', value: `<#${message.channel.id}>` },
+        )
+        .setTimestamp();
+      await logChannel.send({ embeds: [embed] }).catch(() => {});
+    }
+  }
 }
 
 // ── GitHub polling logic ────────────────────────────────────────────────────
 
 async function pollCommits(client) {
-  for (const repo of db.repos) {
-    try {
-      const { newCommits, latestSHA } = await fetchCommits(repo.owner, repo.repo, repo.lastSHA);
+  for (const [guildId, gdb] of Object.entries(db.guilds)) {
+    for (const repo of gdb.repos) {
+      try {
+        const { newCommits, latestSHA } = await fetchCommits(repo.owner, repo.repo, repo.lastSHA);
 
-      if (latestSHA && latestSHA !== repo.lastSHA) {
-        repo.lastSHA = latestSHA;
-        saveDB();
+        if (latestSHA && latestSHA !== repo.lastSHA) {
+          repo.lastSHA = latestSHA;
+          saveDB();
+        }
+
+        if (!newCommits.length) continue;
+
+        const channelId = gdb.channels[`repo_${repo.id}`] || gdb.channels['global'];
+        if (!channelId) continue;
+
+        const channel = await client.channels.fetch(channelId).catch(() => null);
+        // Guard against a channel ID that no longer belongs to this guild
+        // (e.g. stale data, or the channel was moved/deleted).
+        if (!channel || channel.guildId !== guildId) continue;
+
+        for (const commit of newCommits.reverse()) {
+          const embed = buildCommitEmbed(repo, commit);
+          await channel.send({ embeds: [embed] });
+        }
+      } catch (err) {
+        console.error(`Error polling ${repo.owner}/${repo.repo} for guild ${guildId}:`, err.message);
       }
-
-      if (!newCommits.length) continue;
-
-      const channelId = db.channels[`repo_${repo.id}`] || db.channels['global'];
-      if (!channelId) continue;
-
-      const channel = await client.channels.fetch(channelId).catch(() => null);
-      if (!channel) continue;
-
-      for (const commit of newCommits.reverse()) {
-        const embed = buildCommitEmbed(repo, commit);
-        await channel.send({ embeds: [embed] });
-      }
-    } catch (err) {
-      console.error(`Error polling ${repo.owner}/${repo.repo}:`, err.message);
     }
   }
 }

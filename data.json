@@ -1,43 +1,80 @@
 {
-  "nextId": 5,
-  "repos": [
-    {
-      "id": 1,
-      "owner": "LightNabz",
-      "repo": "fin",
-      "url": "https://github.com/LightNabz/fin",
-      "lastSHA": "3be25191648a88a0f83a68b1a2e2f37cccddf056"
+  "guilds": {
+    "1488844177298165870": {
+      "nextId": 5,
+      "repos": [
+        {
+          "id": 1,
+          "owner": "LightNabz",
+          "repo": "fin",
+          "url": "https://github.com/LightNabz/fin",
+          "lastSHA": "3be25191648a88a0f83a68b1a2e2f37cccddf056"
+        },
+        {
+          "id": 2,
+          "owner": "LightNabz",
+          "repo": "LightNabz.github.io",
+          "url": "https://github.com/LightNabz/LightNabz.github.io",
+          "lastSHA": "c55007dba5865b0e48178cc10ac491eb583aed40"
+        },
+        {
+          "id": 3,
+          "owner": "LightNabz",
+          "repo": "redu-chan",
+          "url": "https://github.com/LightNabz/redu-chan",
+          "lastSHA": "5396989ea24e131523624ea9c0e4ac3b911c4c28"
+        },
+        {
+          "id": 4,
+          "owner": "end-4",
+          "repo": "dots-hyprland",
+          "url": "https://github.com/end-4/dots-hyprland",
+          "lastSHA": "c04b0bbc8143a2b2166c1f699f7583cb28ff78fe"
+        },
+        {
+          "id": 5,
+          "owner": "torvalds",
+          "repo": "linux",
+          "url": "https://github.com/torvalds/linux",
+          "lastSHA": "4a50a141f05a8d1737661b19ee22ff8455b94409"
+        }
+      ],
+      "channels": {
+        "global": "1515704229866504312"
+      }
     },
-    {
-      "id": 2,
-      "owner": "LightNabz",
-      "repo": "LightNabz.github.io",
-      "url": "https://github.com/LightNabz/LightNabz.github.io",
-      "lastSHA": "c55007dba5865b0e48178cc10ac491eb583aed40"
+    "609360314676543489": {
+      "nextId": 0,
+      "repos": [],
+      "channels": {}
     },
-    {
-      "id": 3,
-      "owner": "LightNabz",
-      "repo": "redu-chan",
-      "url": "https://github.com/LightNabz/redu-chan",
-      "lastSHA": "7a3552087c47acce236f22a4759e6da0f1144d60"
-    },
-    {
-      "id": 4,
-      "owner": "end-4",
-      "repo": "dots-hyprland",
-      "url": "https://github.com/end-4/dots-hyprland",
-      "lastSHA": "c04b0bbc8143a2b2166c1f699f7583cb28ff78fe"
-    },
-    {
-      "id": 5,
-      "owner": "torvalds",
-      "repo": "linux",
-      "url": "https://github.com/torvalds/linux",
-      "lastSHA": "665159e246749578d4e4bfe106ee3b74edcdab18"
+    "1041138317288284190": {
+      "nextId": 0,
+      "repos": [],
+      "channels": {}
     }
-  ],
-  "channels": {
-    "global": "1515704229866504312"
+  },
+  "phishing": {
+    "1041138317288284190": {
+      "watched_roles": [],
+      "actions": [
+        "delete",
+        "send_dm",
+        "mute"
+      ],
+      "keywords": [
+        "mr. beast",
+        "mrbeast",
+        "promo code",
+        "dasowin",
+        "giveaway",
+        "claim",
+        "deposit"
+      ],
+      "keyword_threshold": 2,
+      "blast_channels": 3,
+      "blast_window_ms": 60000,
+      "log_channel": "1126778267312078969"
+    }
   }
 }
